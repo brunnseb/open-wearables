@@ -1,0 +1,62 @@
+"""Core discovers this extension, schedules its two beat entries, and switches it off on a new core.
+
+These are Review Focus #1 and #3: on core 0.12/1.0 (which deletes `app/algorithms` and
+`app/services/scores`) the app must load with the extension disabled rather than crash, and
+core's own score tasks must not be scheduled alongside these ones.
+"""
+
+import pytest
+from ow_scores_classic.extension import OwScoresClassicExtension
+
+from app.extensions import collect_beat_schedule, get_extensions
+
+BEAT_KEYS = {
+    "ow-scores-classic-fill-missing-sleep-scores",
+    "ow-scores-classic-fill-missing-resilience-scores",
+}
+TASK_NAMES = {
+    "ow_scores_classic.fill_missing_sleep_scores",
+    "ow_scores_classic.fill_missing_resilience_scores",
+}
+
+
+def test_beat_entries_use_only_documented_fields() -> None:
+    sched = OwScoresClassicExtension().beat_schedule()
+    assert set(sched) == {
+        "ow-scores-classic-fill-missing-sleep-scores",
+        "ow-scores-classic-fill-missing-resilience-scores",
+    }
+    for entry in sched.values():
+        assert set(entry) <= {"task", "schedule", "args", "kwargs", "options", "relative"}
+        assert entry["schedule"] == 600.0
+    assert {entry["task"] for entry in sched.values()} == TASK_NAMES
+
+
+def test_core_discovers_the_extension() -> None:
+    """The entry point is installed, so core loads it and schedules its beats."""
+    get_extensions.cache_clear()
+    mine = [e for e in get_extensions() if e.name == "ow_scores_classic"]
+
+    assert mine, f"extension not discovered: {[e.name for e in get_extensions()]}"
+    assert mine[0].active, f"extension disabled: {mine[0].error}"
+    assert mine[0].extension is not None
+    assert mine[0].extension.requires_core == ">=0.11,<0.12"
+
+    sched = collect_beat_schedule()
+    assert set(sched) >= BEAT_KEYS, f"beats not collected: {sorted(sched)}"
+
+
+def test_core_disables_the_extension_on_a_newer_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Core 0.12 removes the modules this package imports: it must disable, not crash the app."""
+    monkeypatch.setattr("app.extensions.core_version", "0.12.0")
+    get_extensions.cache_clear()
+    try:
+        mine = [e for e in get_extensions() if e.name == "ow_scores_classic"]
+
+        assert mine
+        assert not mine[0].active
+        assert "requires core" in (mine[0].error or "")
+        # Disabled extensions contribute no beat entries, so core's tasks stay the only writers.
+        assert not (BEAT_KEYS & set(collect_beat_schedule()))
+    finally:
+        get_extensions.cache_clear()

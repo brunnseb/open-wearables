@@ -10,7 +10,6 @@ import math
 
 import numpy as np
 import pytest
-
 from ow_scores_classic.algorithms.resilience import calculate_hrv_cv
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,10 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
-from ow_scores_classic.algorithms.config import sleep_config
-from ow_scores_classic.algorithms.primitives import ScoreBounds, score_sigmoid, time_to_hours_past_noon
 from app.constants.sleep import ASLEEP_STAGES, SleepStageType
 from app.schemas.model_crud.activities.sleep import SleepStage
+from ow_scores_classic.algorithms.config import sleep_config
+from ow_scores_classic.algorithms.primitives import ScoreBounds, score_sigmoid, time_to_hours_past_noon
 
 
 class SleepComponentScore(BaseModel):

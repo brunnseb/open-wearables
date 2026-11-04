@@ -10,7 +10,6 @@ These tests exercise pure-Python logic only — no database, no factories.
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from ow_scores_classic.algorithms.primitives import score_sigmoid, time_to_hours_past_noon
 from ow_scores_classic.algorithms.sleep import (
     STAGE_SCORE_BOUNDS,
@@ -24,6 +23,7 @@ from ow_scores_classic.algorithms.sleep import (
     calculate_total_stages_score,
     significant_awakenings,
 )
+
 from app.constants.sleep import SleepStageType
 from app.schemas.model_crud.activities.sleep import SleepStage
 

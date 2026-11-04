@@ -34,7 +34,7 @@ def _result() -> HrvCvScoreResult:
     )
 
 
-def test_hrv_result_serialises_like_core():
+def test_hrv_result_serialises_like_core() -> None:
     dumped = _result().model_dump()
 
     assert set(dumped) == CORE_RESULT_KEYS
@@ -45,7 +45,7 @@ def test_hrv_result_serialises_like_core():
     assert dumped["daily_scores"][1]["has_data"] is False
 
 
-def test_daily_score_builds_from_an_orm_row_like_core():
+def test_daily_score_builds_from_an_orm_row_like_core() -> None:
     """`from_attributes=True` is how the service builds these from `SeriesSample` rows."""
 
     class Row:

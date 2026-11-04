@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from ow_scores_classic.algorithms.config import resilience_config
 from ow_scores_classic.services.resilience_service import resilience_score_service
@@ -81,11 +82,7 @@ def _num(value: Any) -> Decimal:
     return Decimal(str(round(value, 3) if isinstance(value, float) else value))
 
 
-def _report(line: str) -> None:
-    print(line)
-
-
-def check_sleep(db: Any, cutoff: datetime) -> int:
+def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
     rows = db.execute(_STORED_SLEEP, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
     for row in rows:
@@ -97,15 +94,15 @@ def check_sleep(db: Any, cutoff: datetime) -> int:
         try:
             built = {s.event_record_id: s for s in sleep_score_service.build_internal_sleep_scores(db, uid, sessions)}
         except Exception as exc:  # a recomputation that cannot run is a parity failure, not a skip
-            _report(f"{cutoff.date()} sleep RECOMPUTE-ERROR {exc}")
-            return len(user_rows)
+            print(f"{cutoff.date()} sleep RECOMPUTE-ERROR {exc}")
+            return len(user_rows), 0
 
         for row in user_rows:
             record_id = UUID(str(row.event_record_id))
             created = built.get(record_id)
             day = row.recorded_at.date()
             if created is None:
-                _report(f"{day} sleep stored={row.value} recomputed=NONE MISMATCH")
+                print(f"{day} sleep stored={row.value} recomputed=NONE MISMATCH")
                 mismatches += 1
                 continue
             stored_v, recomp_v = _num(row.value), _num(created.value)
@@ -113,14 +110,14 @@ def check_sleep(db: Any, cutoff: datetime) -> int:
             ok = _num(stored_v) == _num(recomp_v) and stored_c == recomp_c
             if not ok:
                 mismatches += 1
-            _report(
+            print(
                 f"{day} sleep stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} "
                 f"{'OK' if ok else 'MISMATCH'}"
             )
-    return mismatches
+    return mismatches, 0
 
 
-def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
+def check_resilience(db: Any, cutoff: datetime, timezone_: ZoneInfo, now: datetime | None = None) -> tuple[int, int]:
     """Returns (mismatches, drift) — drift is a score in a lookback window that is still open."""
     rows = db.execute(_STORED_RESILIENCE, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
@@ -129,20 +126,22 @@ def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
 
     mismatches = 0
     drift = 0
-    today = date.today()
+    # Rows are dated in the user's zone, so "today" has to be their today: the server's UTC date
+    # is a day behind for every zone east of Greenwich and shifts the drift/mismatch boundary.
+    today = (now or datetime.now(timezone_)).date()
     for uid, user_rows in by_user.items():
         ref_dates: list[date] = sorted({r.recorded_at.date() for r in user_rows})
         try:
             results = resilience_score_service.get_hrv_cv_scores_for_date_range(db, uid, ref_dates)
         except Exception as exc:
-            _report(f"{cutoff.date()} resilience RECOMPUTE-ERROR {exc}")
+            print(f"{cutoff.date()} resilience RECOMPUTE-ERROR {exc}")
             return len(user_rows), 0
 
         for row in user_rows:
             day = row.recorded_at.date()
             result = results.get(day)
             if result is None or result.hrv_cv is None:
-                _report(f"{day} resilience stored={row.value} recomputed=NONE MISMATCH")
+                print(f"{day} resilience stored={row.value} recomputed=NONE MISMATCH")
                 mismatches += 1
                 continue
             stored_v, recomp_v = _num(row.value), _num(result.hrv_cv)
@@ -162,19 +161,20 @@ def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
             else:
                 mismatches += 1
                 status = "MISMATCH"
-            _report(f"{day} resilience stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}")
+            print(f"{day} resilience stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}")
     return mismatches, drift
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=30, help="Look-back window (default 30)")
+    parser.add_argument("--timezone", default="Europe/Vienna", help="User timezone (default Europe/Vienna)")
     args = parser.parse_args()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     with SessionLocal() as db:
-        sleep_bad = check_sleep(db, cutoff)
-        resilience_bad, resilience_drift = check_resilience(db, cutoff)
+        sleep_bad, _ = check_sleep(db, cutoff)
+        resilience_bad, resilience_drift = check_resilience(db, cutoff, ZoneInfo(args.timezone))
 
     print(
         f"parity: {sleep_bad + resilience_bad} mismatch(es), {resilience_drift} drift "

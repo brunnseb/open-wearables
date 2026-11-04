@@ -24,6 +24,16 @@ The tests under `tests/` and `backend/tests/extensions/ow_scores_classic/` are u
 tests, copied with imports rewritten and no assertion changed, so that the numbers this package
 produces stay the numbers upstream computed.
 
+## Core files this extension changes
+
+Nothing under `backend/app/` is touched — the core runs unmodified and this package is installed
+as a layer on top. One test file outside the package changes, so that a rebase onto a newer
+upstream reapplies it:
+
+| File | Change | Why |
+|---|---|---|
+| `backend/tests/constants/test_celery_tasks.py` | `test_beat_schedule_and_routes_use_constants` scopes its beat set to task names starting with `app.` | Core's own extension API (`app.extensions.collect_beat_schedule`) lets an extension add beat entries, and an extension's tasks live in its own package, outside `app.` — so the unscoped assertion fails for *any* extension that schedules periodic work, not just this one. Same filter `test_core_tasks_and_constants_match` in the same file already uses. |
+
 ## MIT license (upstream `LICENSE` at `ow-scores-last`)
 
 ```

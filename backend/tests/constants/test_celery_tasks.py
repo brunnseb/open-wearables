@@ -27,7 +27,11 @@ def test_core_tasks_and_constants_match() -> None:
 
 def test_beat_schedule_and_routes_use_constants() -> None:
     celery_app = _celery_app()
-    beat_tasks = {entry["task"] for entry in celery_app.conf.beat_schedule.values()}
+    # Core's own entries only: extensions add beat entries through
+    # app.extensions.collect_beat_schedule, and their tasks live in the extension's package, so
+    # they are namespaced outside "app." and are not core constants (same filter as
+    # test_core_tasks_and_constants_match).
+    beat_tasks = {entry["task"] for entry in celery_app.conf.beat_schedule.values() if entry["task"].startswith("app.")}
 
     assert beat_tasks <= set(CeleryTask)
     assert set(celery_app.conf.task_routes) <= set(CeleryTask)

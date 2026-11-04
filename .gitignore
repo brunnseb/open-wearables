@@ -180,3 +180,5 @@ CLAUDE.local.md
 # Locally checked-out extensions
 extensions/*
 !extensions/.gitkeep
+# Fork-owned extension package — tracked, unlike the local drop-ins above
+!extensions/ow-scores-classic/

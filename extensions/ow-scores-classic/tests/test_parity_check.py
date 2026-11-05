@@ -82,7 +82,13 @@ def _resilience_row(day: date, value: str, created_at: datetime = _ROW_WRITTEN) 
         recorded_at=datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc),
         created_at=created_at,
         value=Decimal(value),
-        components={"days_counted": 14, "metric_type": "hrv", "resilience_score": 62.0},
+        # The real `components` JSON shape, so these rows differ from a recomputation only on the
+        # axis each test is about.
+        components={
+            "days_counted": {"value": 14},
+            "metric_type": {"qualifier": "hrv"},
+            "resilience_score": {"value": 62.0},
+        },
     )
 
 
@@ -165,6 +171,41 @@ def test_a_sleep_mismatch_whose_session_was_resynced_after_the_row_is_drift(
     )
 
     assert parity.check_sleep(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 1)
+
+
+def test_a_value_that_only_differs_by_how_the_last_digit_rounded_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`value` is NUMERIC(6,3): Postgres rounded half-away-from-zero at write time, `round()` is banker's.
+
+    A CV of 0.1235 was stored as 0.124 and recomputes to 0.123, so comparing the two *rounded* copies
+    — which is what `abs(stored - _num(recomputed)) <= 0.0005` degenerates to, since both sides then
+    carry exactly three decimals — calls a faithful recomputation a MISMATCH. The stored number may
+    only be off by half its last digit, which is what the comparison has to allow.
+    """
+    monkeypatch.setattr(parity.resilience_config, "lookback_days", 1)
+    monkeypatch.setattr(
+        parity.resilience_score_service,
+        "get_hrv_cv_scores_for_date_range",
+        lambda _db, _uid, days: {
+            d: SimpleNamespace(hrv_cv=0.1235, days_counted=14, metric_type="hrv", resilience_score=62.0) for d in days
+        },
+    )
+    db = _StubDB([_resilience_row(date(2026, 11, 3), "0.124")])
+
+    assert parity.check_resilience(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 0)
+
+
+def test_a_sleep_value_that_only_differs_by_the_last_digit_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sleep path compared the two rounded copies exactly, so the same boundary was a MISMATCH."""
+    monkeypatch.setattr(
+        parity.sleep_score_service,
+        "build_internal_sleep_scores",
+        lambda _db, _uid, sessions: [
+            SimpleNamespace(event_record_id=rid, value=80.0015, components={}) for rid, _ds, _end in sessions
+        ],
+    )
+    db = _StubDB([_sleep_row(date(2026, 11, 3), "80.002")])
+
+    assert parity.check_sleep(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 0)
 
 
 def test_a_recompute_that_cannot_run_counts_as_a_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:

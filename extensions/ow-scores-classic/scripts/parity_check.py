@@ -105,7 +105,7 @@ _INGEST_SLEEP_SESSIONS_BY_DAY = text("""
     GROUP BY 1
 """)
 
-# Stored as NUMERIC(6,3): the DB rounds, so compare at the stored precision.
+# Half of the last digit `value` can hold: see `_same_value`. NUMERIC(6,3) -> 0.0005.
 _TOLERANCE = Decimal("0.0005")
 
 
@@ -131,6 +131,19 @@ def _num(value: Any) -> Decimal:
     return Decimal(str(round(value, 3) if isinstance(value, float) else value))
 
 
+def _same_value(stored: Any, recomputed: Any) -> bool:
+    """Would this recomputed number have been stored as this exact row?
+
+    `value` is NUMERIC(6,3): the row holds what Postgres wrote with half-away-from-zero rounding,
+    while Python's `round()` is banker's, so a faithful recomputation of a value that sat on the
+    last digit's boundary comes back one digit away. Comparing the two rounded copies — which is
+    what an exact compare, or a tolerance applied *after* rounding both sides to the stored three
+    decimals, both amount to — reports that as a MISMATCH. Half the stored digit, against the
+    unrounded number, is the comparison that actually allows for it.
+    """
+    return abs(_num(stored) - Decimal(str(recomputed))) <= _TOLERANCE
+
+
 def _merge_ingest(out: dict[date, datetime], rows: list[Any]) -> dict[date, datetime]:
     """Fold `(day, ingested_at)` rows into a newest-write-per-day map."""
     for day, ingested_at in rows:
@@ -139,16 +152,16 @@ def _merge_ingest(out: dict[date, datetime], rows: list[Any]) -> dict[date, date
     return out
 
 
-def _sleep_ingest_by_day(db: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
+def _sleep_ingest_by_day(session: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
     """Newest write per night, over the sleep sessions the sleep score reads for one user."""
-    return _merge_ingest({}, db.execute(_INGEST_SLEEP_SESSIONS_BY_DAY, {"uid": uid, "cutoff": cutoff}).fetchall())
+    return _merge_ingest({}, session.execute(_INGEST_SLEEP_SESSIONS_BY_DAY, {"uid": uid, "cutoff": cutoff}).fetchall())
 
 
-def _resilience_ingest_by_day(db: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
+def _resilience_ingest_by_day(session: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
     """Newest write per day, over both inputs the resilience score reads for one user."""
     params = {"uid": uid, "cutoff": cutoff, "type_id": _RMSSD_TYPE_ID}
-    out = _merge_ingest({}, db.execute(_INGEST_SAMPLES_BY_DAY, params).fetchall())
-    return _merge_ingest(out, db.execute(_INGEST_SLEEP_AGGREGATES_BY_DAY, params).fetchall())
+    out = _merge_ingest({}, session.execute(_INGEST_SAMPLES_BY_DAY, params).fetchall())
+    return _merge_ingest(out, session.execute(_INGEST_SLEEP_AGGREGATES_BY_DAY, params).fetchall())
 
 
 def _inputs_moved(
@@ -171,9 +184,9 @@ def _resilience_window(ref_day: date) -> list[date]:
     return [ref_day - timedelta(days=i) for i in range(resilience_config.lookback_days, 0, -1)]
 
 
-def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
+def check_sleep(session: Any, cutoff: datetime) -> tuple[int, int]:
     """Returns (mismatches, drift) — drift is a mismatch whose own inputs moved after the row."""
-    rows = db.execute(_STORED_SLEEP, {"cutoff": cutoff}).fetchall()
+    rows = session.execute(_STORED_SLEEP, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
     for row in rows:
         by_user[UUID(str(row.user_id))].append(row)
@@ -182,9 +195,11 @@ def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
     drift = 0
     for uid, user_rows in by_user.items():
         sessions = [(UUID(str(r.event_record_id)), UUID(str(r.data_source_id)), r.local_end) for r in user_rows]
-        ingest = _sleep_ingest_by_day(db, uid, cutoff)
+        ingest = _sleep_ingest_by_day(session, uid, cutoff)
         try:
-            built = {s.event_record_id: s for s in sleep_score_service.build_internal_sleep_scores(db, uid, sessions)}
+            built = {
+                s.event_record_id: s for s in sleep_score_service.build_internal_sleep_scores(session, uid, sessions)
+            }
         except Exception as exc:  # a recomputation that cannot run is a parity failure, not a skip
             print(f"{cutoff.date()} sleep RECOMPUTE-ERROR {exc}")
             return len(user_rows), 0
@@ -199,7 +214,7 @@ def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
                 continue
             stored_v, recomp_v = _num(row.value), _num(created.value)
             stored_c, recomp_c = _components(row.components), _components(created.components)
-            ok = _num(stored_v) == _num(recomp_v) and stored_c == recomp_c
+            ok = _same_value(row.value, created.value) and stored_c == recomp_c
             if ok:
                 status = "OK"
             elif _inputs_moved(row.created_at, _sleep_window(row.local_start), ingest):
@@ -214,9 +229,9 @@ def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
     return mismatches, drift
 
 
-def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
+def check_resilience(session: Any, cutoff: datetime) -> tuple[int, int]:
     """Returns (mismatches, drift) — drift is a mismatch whose own inputs moved after the row."""
-    rows = db.execute(_STORED_RESILIENCE, {"cutoff": cutoff}).fetchall()
+    rows = session.execute(_STORED_RESILIENCE, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
     for row in rows:
         by_user[UUID(str(row.user_id))].append(row)
@@ -225,9 +240,9 @@ def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
     drift = 0
     for uid, user_rows in by_user.items():
         ref_dates: list[date] = sorted({r.recorded_at.date() for r in user_rows})
-        ingest = _resilience_ingest_by_day(db, uid, cutoff)
+        ingest = _resilience_ingest_by_day(session, uid, cutoff)
         try:
-            results = resilience_score_service.get_hrv_cv_scores_for_date_range(db, uid, ref_dates)
+            results = resilience_score_service.get_hrv_cv_scores_for_date_range(session, uid, ref_dates)
         except Exception as exc:
             print(f"{cutoff.date()} resilience RECOMPUTE-ERROR {exc}")
             return len(user_rows), 0
@@ -246,7 +261,7 @@ def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
                 "metric_type": result.metric_type,
                 "resilience_score": result.resilience_score,
             }
-            ok = abs(stored_v - recomp_v) <= _TOLERANCE and stored_c == recomp_c
+            ok = _same_value(row.value, result.hrv_cv) and stored_c == recomp_c
             if ok:
                 status = "OK"
             elif _inputs_moved(row.created_at, _resilience_window(day), ingest):
@@ -265,9 +280,9 @@ def main() -> int:
     args = parser.parse_args()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
-    with SessionLocal() as db:
-        sleep_bad, sleep_drift = check_sleep(db, cutoff)
-        resilience_bad, resilience_drift = check_resilience(db, cutoff)
+    with SessionLocal() as session:
+        sleep_bad, sleep_drift = check_sleep(session, cutoff)
+        resilience_bad, resilience_drift = check_resilience(session, cutoff)
 
     print(
         f"parity: {sleep_bad + resilience_bad} mismatch(es), {sleep_drift + resilience_drift} drift "

@@ -10,6 +10,7 @@ old".
 
 import importlib.util
 import sys
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -51,19 +52,33 @@ def test_numeric_compare_works_across_decimal_and_float() -> None:
 class _StubDB:
     """Stands in for a Session, answering each of the gate's selects with its own rows.
 
-    The gate reads two kinds of thing — the stored scores and the per-day ingest times — and a stub
-    that answered both with the same rows would feed score rows into the drift rule and pass on
-    anything.
+    The gate reads three kinds of thing — the stored scores, the per-day ingest times and the rows
+    the writer has not filled yet — and a stub that answered them all with the same rows would feed
+    score rows into the drift rule and pass on anything.
     """
 
-    def __init__(self, stored: list[object], ingest: list[tuple[date, datetime]] | None = None) -> None:
+    def __init__(
+        self,
+        stored: list[object],
+        ingest: list[tuple[date, datetime]] | None = None,
+        sleep_missing: list[object] | None = None,
+        resilience_missing: list[object] | None = None,
+    ) -> None:
         self._stored = stored
         self._ingest: list[object] = list(ingest or [])
+        self._sleep_missing: list[object] = list(sleep_missing or [])
+        self._resilience_missing: list[object] = list(resilience_missing or [])
         self._pending: list[object] = []
 
     def execute(self, statement: Any, *_a: object, **_k: object) -> "_StubDB":
-        is_stored = statement is parity._STORED_SLEEP or statement is parity._STORED_RESILIENCE
-        self._pending = self._stored if is_stored else self._ingest
+        # Keyed by identity: a SQLAlchemy clause's `==` builds SQL, it does not compare.
+        tables = {
+            id(parity._STORED_SLEEP): self._stored,
+            id(parity._STORED_RESILIENCE): self._stored,
+            id(parity._MISSING_SCORES_QUERY): self._sleep_missing,
+            id(parity._MISSING_RESILIENCE_SCORES_QUERY): self._resilience_missing,
+        }
+        self._pending = tables.get(id(statement), self._ingest)
         return self
 
     def fetchall(self) -> list[object]:
@@ -206,6 +221,46 @@ def test_a_sleep_value_that_only_differs_by_the_last_digit_is_ok(monkeypatch: py
     db = _StubDB([_sleep_row(date(2026, 11, 3), "80.002")])
 
     assert parity.check_sleep(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 0)
+
+
+def test_a_row_line_names_its_user(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """A second user's rows have to be attributable, or the output cannot be acted on."""
+    monkeypatch.setattr(parity.resilience_config, "lookback_days", 1)
+    monkeypatch.setattr(parity.resilience_score_service, "get_hrv_cv_scores_for_date_range", _stub_results)
+    db = _StubDB([_resilience_row(date(2026, 11, 3), "9.0")])  # stored == recomputed: the OK path
+
+    assert parity.check_resilience(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 0)
+
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("2026-11-03 resilience")
+    assert f"user={_USER}" in line
+    assert line.endswith("OK")
+
+
+def test_rows_the_writer_has_not_filled_are_informational(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A date with no score yet is a gap the fill task still has to close, not a vendoring bug.
+
+    This is the MISSING status the module docstring has always advertised and the checks could never
+    print — they iterate stored rows, so an absent row is invisible. It comes from the writer's own
+    queries and must never move the exit code: a gate that fails on a healthy box is a gate nobody
+    runs, and this one gates a cutover.
+    """
+    monkeypatch.setattr(sys, "argv", ["parity_check", "--days", "30"])
+    db = _StubDB(
+        [],
+        sleep_missing=[SimpleNamespace(user_id=_USER, wake_date=date(2026, 11, 3))],
+        resilience_missing=[SimpleNamespace(user_id=_USER, reference_date=date(2026, 11, 2))],
+    )
+    monkeypatch.setattr(parity, "SessionLocal", lambda: nullcontext(db))
+
+    assert parity.main() == 0
+
+    out = capsys.readouterr().out
+    assert f"2026-11-03 sleep user={_USER} MISSING" in out
+    assert f"2026-11-02 resilience user={_USER} MISSING" in out
+    assert "2 still to fill" in out
 
 
 def test_a_recompute_that_cannot_run_counts_as_a_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:

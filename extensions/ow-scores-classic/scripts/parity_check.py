@@ -8,8 +8,13 @@ wrong — investigate it, never "tune" a number.
 
 Read-only: it writes nothing.
 
-One line per row:  date  category  stored  recomputed  OK|MISSING|MISMATCH|DRIFT
-Exit 0 when every stored score in a closed window is reproduced; 1 on any MISMATCH.
+One line per stored row:  date  category  user=<id>  stored=<v>/<comps>  recomputed=<v>/<comps>  OK|MISMATCH|DRIFT
+One line per gap:         date  category  user=<id>  MISSING
+Exit 0 when every stored score in a closed window is reproduced; 1 on any MISMATCH. MISSING and
+DRIFT are informational: they are reported, counted and never failed.
+
+MISSING is a row the fill tasks would still write, read from their own queries, so the gate's idea
+of a gap is the writer's: it is not a parity failure, just the state of a window still being filled.
 
 A mismatching row is DRIFT, not MISMATCH, when the inputs it was computed from moved after the row
 was written: any day inside that row's own lookback window got new data later than the row's own
@@ -18,7 +23,6 @@ re-synced, a restored backup rewrites both — so recomputing such a row legitim
 run that wrote it never had. Age is not the question and stops mattering entirely: a row 8 days old
 whose inputs all predate it must still reproduce exactly, and a row written minutes ago whose inputs
 never moved is a real mismatch. A MISMATCH therefore always means the vendored code differs.
-MISSING (nothing stored for a date the services would score) is informational, not a failure.
 """
 
 import argparse
@@ -32,10 +36,16 @@ from uuid import UUID
 from ow_scores_classic.algorithms.config import resilience_config, sleep_config
 from ow_scores_classic.services.resilience_service import resilience_score_service
 from ow_scores_classic.services.sleep_service import sleep_score_service
+from ow_scores_classic.tasks import (
+    _MISSING_RESILIENCE_SCORES_QUERY,
+    _MISSING_SCORES_QUERY,
+    _RMSSD_TYPE_ID,
+    _SDNN_TYPE_ID,
+)
 from sqlalchemy import text
 
+from app.config import settings
 from app.database import SessionLocal
-from app.schemas.enums import SeriesType, get_series_type_id
 
 # Same rows the fill tasks write, so the comparison is against the task's own code path.
 _STORED_SLEEP = text("""
@@ -63,7 +73,6 @@ _STORED_RESILIENCE = text("""
 
 # When each input day was last written, per day, bucketed exactly the way the service that reads it
 # buckets. A stored row is only re-checkable while nothing it read has been written since it was.
-_RMSSD_TYPE_ID = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
 
 # The resilience score averages RMSSD samples bucketed by UTC date (and a night's session value,
 # which rides on the sleep record as an aggregate), so both are inputs to it.
@@ -209,7 +218,7 @@ def check_sleep(session: Any, cutoff: datetime) -> tuple[int, int]:
             created = built.get(record_id)
             day = row.recorded_at.date()
             if created is None:
-                print(f"{day} sleep stored={row.value} recomputed=NONE MISMATCH")
+                print(f"{day} sleep user={row.user_id} stored={row.value} recomputed=NONE MISMATCH")
                 mismatches += 1
                 continue
             stored_v, recomp_v = _num(row.value), _num(created.value)
@@ -225,7 +234,9 @@ def check_sleep(session: Any, cutoff: datetime) -> tuple[int, int]:
             else:
                 mismatches += 1
                 status = "MISMATCH"
-            print(f"{day} sleep stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}")
+            print(
+                f"{day} sleep user={row.user_id} stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}"
+            )
     return mismatches, drift
 
 
@@ -251,7 +262,7 @@ def check_resilience(session: Any, cutoff: datetime) -> tuple[int, int]:
             day = row.recorded_at.date()
             result = results.get(day)
             if result is None or result.hrv_cv is None:
-                print(f"{day} resilience stored={row.value} recomputed=NONE MISMATCH")
+                print(f"{day} resilience user={row.user_id} stored={row.value} recomputed=NONE MISMATCH")
                 mismatches += 1
                 continue
             stored_v, recomp_v = _num(row.value), _num(result.hrv_cv)
@@ -270,8 +281,37 @@ def check_resilience(session: Any, cutoff: datetime) -> tuple[int, int]:
             else:
                 mismatches += 1
                 status = "MISMATCH"
-            print(f"{day} resilience stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}")
+            print(
+                f"{day} resilience user={row.user_id} stored={stored_v}/{stored_c} "
+                f"recomputed={recomp_v}/{recomp_c} {status}"
+            )
     return mismatches, drift
+
+
+def check_missing(session: Any) -> tuple[int, int]:
+    """Rows the fill tasks would still write today — the writer's own queries, and never a failure.
+
+    Reusing `tasks._MISSING_*_QUERY` rather than a near-copy is the point: the gate's idea of a gap
+    is then exactly the writer's, so a date the writer legitimately leaves unscored (insufficient
+    HRV yet) cannot be reported here as a parity problem.
+    """
+    gaps_cutoff = datetime.now(timezone.utc) - timedelta(days=settings.score_backfill_days)
+    sleep_gaps = session.execute(_MISSING_SCORES_QUERY, {"cutoff": gaps_cutoff}).fetchall()
+    for row in sleep_gaps:
+        print(f"{row.wake_date} sleep user={row.user_id} MISSING")
+
+    resilience_gaps = session.execute(
+        _MISSING_RESILIENCE_SCORES_QUERY,
+        {
+            "backfill_days": settings.score_backfill_days,
+            "rmssd_id": _RMSSD_TYPE_ID,
+            "sdnn_id": _SDNN_TYPE_ID,
+            "data_lookback_days": settings.score_backfill_days + resilience_config.lookback_days,
+        },
+    ).fetchall()
+    for row in resilience_gaps:
+        print(f"{row.reference_date} resilience user={row.user_id} MISSING")
+    return len(sleep_gaps), len(resilience_gaps)
 
 
 def main() -> int:
@@ -283,10 +323,12 @@ def main() -> int:
     with SessionLocal() as session:
         sleep_bad, sleep_drift = check_sleep(session, cutoff)
         resilience_bad, resilience_drift = check_resilience(session, cutoff)
+        gaps = sum(check_missing(session))
 
     print(
         f"parity: {sleep_bad + resilience_bad} mismatch(es), {sleep_drift + resilience_drift} drift "
-        f"(inputs rewritten after the row) over the last {args.days} days"
+        f"(inputs rewritten after the row), {gaps} still to fill (informational) "
+        f"over the last {args.days} days"
     )
     return 1 if sleep_bad + resilience_bad else 0
 

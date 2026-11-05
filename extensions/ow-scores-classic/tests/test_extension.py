@@ -2,12 +2,14 @@
 
 These are Review Focus #1 and #3: on core 0.12/1.0 (which deletes `app/algorithms` and
 `app/services/scores`) the app must load with the extension disabled rather than crash, and
-core's own score tasks must not be scheduled alongside these ones.
+core's own score tasks must not be scheduled alongside these ones — `ow_scores_enabled` selects
+WHICH of the two writers runs, in code, not in a `.env` file.
 """
 
 import pytest
 from ow_scores_classic.extension import OwScoresClassicExtension
 
+from app.config import settings
 from app.extensions import collect_beat_schedule, get_extensions
 
 BEAT_KEYS = {
@@ -20,7 +22,26 @@ TASK_NAMES = {
 }
 
 
-def test_beat_entries_use_only_documented_fields() -> None:
+@pytest.fixture
+def extension_is_the_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cutover state: core's own score writer is off, so these beat entries are the only writer."""
+    monkeypatch.setattr(settings, "ow_scores_enabled", False)
+
+
+def test_no_beat_entries_while_core_still_writes_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one-writer invariant, in code: the flag selects WHO writes, so two can never run.
+
+    Core adds its own two entries only under `if settings.ow_scores_enabled` and merges extension
+    entries unconditionally, so returning ours unconditionally shipped an image with both writers
+    scheduled and left the pairing to a manual `.env` flip.
+    """
+    monkeypatch.setattr(settings, "ow_scores_enabled", True)
+
+    assert OwScoresClassicExtension().beat_schedule() == {}
+    assert not BEAT_KEYS & set(collect_beat_schedule())
+
+
+def test_beat_entries_use_only_documented_fields(extension_is_the_writer: None) -> None:
     sched = OwScoresClassicExtension().beat_schedule()
     assert set(sched) == {
         "ow-scores-classic-fill-missing-sleep-scores",
@@ -32,7 +53,7 @@ def test_beat_entries_use_only_documented_fields() -> None:
     assert {entry["task"] for entry in sched.values()} == TASK_NAMES
 
 
-def test_core_discovers_the_extension() -> None:
+def test_core_discovers_the_extension(extension_is_the_writer: None) -> None:
     """The entry point is installed, so core loads it and schedules its beats."""
     get_extensions.cache_clear()
     mine = [e for e in get_extensions() if e.name == "ow_scores_classic"]
@@ -46,7 +67,9 @@ def test_core_discovers_the_extension() -> None:
     assert set(sched) >= BEAT_KEYS, f"beats not collected: {sorted(sched)}"
 
 
-def test_core_disables_the_extension_on_a_newer_core(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_core_disables_the_extension_on_a_newer_core(
+    extension_is_the_writer: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Core 0.12 removes the modules this package imports: it must disable, not crash the app."""
     monkeypatch.setattr("app.extensions.core_version", "0.12.0")
     get_extensions.cache_clear()

@@ -10,6 +10,7 @@ keeps serving, instead of this package importing modules that no longer exist.
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.config import settings
 from app.extensions import OWExtension
 from ow_scores_classic.tasks import FILL_MISSING_RESILIENCE_SCORES, FILL_MISSING_SLEEP_SCORES
 
@@ -33,6 +34,15 @@ class OwScoresClassicExtension(OWExtension):
     migrations: str = ""
 
     def beat_schedule(self) -> dict[str, dict[str, Any]]:
+        """Our two fills, but only while core's own score writer is off.
+
+        Core adds its own two entries under `if settings.ow_scores_enabled` and merges extension
+        entries unconditionally, so emitting ours unconditionally would ship an image with two
+        writers on the same beat and leave the one-writer rule to a manual `.env` flip. The flag
+        selects WHO writes: on = core's tasks, off = this extension's.
+        """
+        if settings.ow_scores_enabled:
+            return {}
         return {
             SLEEP_BEAT_KEY: {
                 "task": FILL_MISSING_SLEEP_SCORES,

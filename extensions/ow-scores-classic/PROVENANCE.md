@@ -7,7 +7,15 @@ license reproduced below (© 2025 Momentum). Upstream removes the Open Wearables
 Score and Resilience Score from the repository on 2026-11-06 and re-ships them as a separate
 package under a **different, undisclosed license** — that future package is not MIT, and nothing
 here is derived from it. Only import statements were rewritten to point at the vendored modules;
-no formula, threshold, or comment was edited. The copied paths, at that tag:
+no formula, threshold, or comment was edited. The one exception is `tasks.py`, which besides its
+imports also **drops the `settings.ow_scores_enabled` early return from both fill tasks and replaces
+upstream's `CeleryTask` enum members with this package's own task-name constants** — the two changes
+its own docstring documents, and the ones the cutover requires: that flag is core's writer switch and
+the box runs with it OFF, so a guard left in place makes this package a permanent no-op. Re-vendoring
+`tasks.py` literally — imports only, on the next upstream pin — is therefore not a mechanical edit:
+the extension would then write **zero** rows while every beat entry reported success, and
+`backend/tests/extensions/ow_scores_classic/test_fill_tasks.py` is what catches it. The copied paths,
+at that tag:
 
 | Vendored as | Upstream path at `ow-scores-last` |
 |---|---|
@@ -18,7 +26,7 @@ no formula, threshold, or comment was edited. The copied paths, at that tag:
 | `ow_scores_classic/schemas.py` | `backend/app/schemas/responses/activity/resilience.py` |
 | `ow_scores_classic/services/sleep_service.py` | `backend/app/services/scores/sleep_service.py` |
 | `ow_scores_classic/services/resilience_service.py` | `backend/app/services/scores/resilience_service.py` |
-| `ow_scores_classic/tasks.py` | `backend/app/integrations/celery/tasks/fill_missing_sleep_scores_task.py` and `.../fill_missing_resilience_scores_task.py` |
+| `ow_scores_classic/tasks.py` | `backend/app/integrations/celery/tasks/fill_missing_sleep_scores_task.py` and `.../fill_missing_resilience_scores_task.py` (plus the two documented changes above: dropped `ow_scores_enabled` guard in both fills, namespaced task names) |
 
 The tests under `tests/` and `backend/tests/extensions/ow_scores_classic/` are upstream's own
 tests, copied with imports rewritten and no assertion changed, so that the numbers this package

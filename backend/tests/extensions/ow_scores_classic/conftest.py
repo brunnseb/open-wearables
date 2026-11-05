@@ -7,7 +7,7 @@ fork must not touch core's manifest). Without this, all three modules here fail 
 
 Caveat: that makes CI test the SOURCE TREE, not a built wheel. Entry-point discovery — core finding
 the extension through the `open_wearables.extensions` group — is not covered here; it stays covered
-by the image smoke test (`scripts/smoke.sh` in the SDD folder), which runs against the installed
+by the image smoke test (`extensions/ow-scores-classic/scripts/smoke.sh`), which runs against the installed
 package inside the published image. A local dev checkout may instead `uv pip install -e
 ../extensions/ow-scores-classic`; `uv sync` prunes that install again.
 """

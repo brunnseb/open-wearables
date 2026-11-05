@@ -11,10 +11,13 @@ Read-only: it writes nothing.
 One line per row:  date  category  stored  recomputed  OK|MISSING|MISMATCH|DRIFT
 Exit 0 when every stored score in a closed window is reproduced; 1 on any MISMATCH.
 
-Resilience rows whose reference date falls inside the still-open lookback window
-(`resilience_config.lookback_days`) are reported as DRIFT, not MISMATCH: that window keeps
-receiving syncs after the row was written, so a later recomputation legitimately sees more HRV
-days than the run that produced the row. A MISMATCH there means the vendored code differs.
+A mismatching row is DRIFT, not MISMATCH, when the inputs it was computed from moved after the row
+was written: any day inside that row's own lookback window got new data later than the row's own
+`created_at`. Providers backfill — a night's HRV arrives the next morning, a whole day can be
+re-synced, a restored backup rewrites both — so recomputing such a row legitimately sees inputs the
+run that wrote it never had. Age is not the question and stops mattering entirely: a row 8 days old
+whose inputs all predate it must still reproduce exactly, and a row written minutes ago whose inputs
+never moved is a real mismatch. A MISMATCH therefore always means the vendored code differs.
 MISSING (nothing stored for a date the services would score) is informational, not a failure.
 """
 
@@ -25,14 +28,14 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
-from ow_scores_classic.algorithms.config import resilience_config
+from ow_scores_classic.algorithms.config import resilience_config, sleep_config
 from ow_scores_classic.services.resilience_service import resilience_score_service
 from ow_scores_classic.services.sleep_service import sleep_score_service
 from sqlalchemy import text
 
 from app.database import SessionLocal
+from app.schemas.enums import SeriesType, get_series_type_id
 
 # Same rows the fill tasks write, so the comparison is against the task's own code path.
 _STORED_SLEEP = text("""
@@ -41,7 +44,9 @@ _STORED_SLEEP = text("""
            hs.value,
            hs.components,
            hs.recorded_at,
+           hs.created_at,
            er.data_source_id,
+           (er.start_datetime + COALESCE(er.zone_offset, '+00:00')::interval) AS local_start,
            (er.end_datetime + COALESCE(er.zone_offset, '+00:00')::interval) AS local_end
     FROM health_score hs
     JOIN event_record er ON er.id = hs.event_record_id
@@ -50,10 +55,54 @@ _STORED_SLEEP = text("""
 """)
 
 _STORED_RESILIENCE = text("""
-    SELECT user_id, recorded_at, value, components
+    SELECT user_id, recorded_at, created_at, value, components
     FROM health_score
     WHERE provider = 'internal' AND category = 'resilience' AND recorded_at >= :cutoff
     ORDER BY user_id, recorded_at
+""")
+
+# When each input day was last written, per day, bucketed exactly the way the service that reads it
+# buckets. A stored row is only re-checkable while nothing it read has been written since it was.
+_RMSSD_TYPE_ID = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
+
+# The resilience score averages RMSSD samples bucketed by UTC date (and a night's session value,
+# which rides on the sleep record as an aggregate), so both are inputs to it.
+_INGEST_SAMPLES_BY_DAY = text("""
+    SELECT (ss.recorded_at AT TIME ZONE 'UTC')::date AS day, MAX(ss.created_at) AS ingested_at
+    FROM series_sample ss
+    JOIN data_source ds ON ds.id = ss.data_source_id
+    WHERE ds.user_id = :uid
+      AND ss.series_type_definition_id = :type_id
+      AND ss.recorded_at >= :cutoff
+    GROUP BY 1
+""")
+
+_INGEST_SLEEP_AGGREGATES_BY_DAY = text("""
+    SELECT (er.end_datetime AT TIME ZONE 'UTC')::date AS day, MAX(GREATEST(er.created_at, a.created_at)) AS ingested_at
+    FROM event_record er
+    JOIN event_record_aggregate a ON a.record_id = er.id
+    JOIN data_source ds ON ds.id = er.data_source_id
+    WHERE ds.user_id = :uid
+      AND er.category = 'sleep'
+      AND a.series_type_definition_id = :type_id
+      AND a.avg IS NOT NULL
+      AND er.end_datetime >= :cutoff
+    GROUP BY 1
+""")
+
+# The sleep score reads sleep sessions only — its own night plus the rolling bedtime history —
+# bucketed by the local start date it buckets them by.
+_INGEST_SLEEP_SESSIONS_BY_DAY = text("""
+    SELECT (er.start_datetime + COALESCE(er.zone_offset, '+00:00')::interval)::date AS day,
+           MAX(GREATEST(er.created_at, sd.created_at)) AS ingested_at
+    FROM event_record er
+    JOIN sleep_details sd ON sd.record_id = er.id
+    JOIN data_source ds ON ds.id = er.data_source_id
+    WHERE ds.user_id = :uid
+      AND er.category = 'sleep'
+      AND (sd.is_nap IS NULL OR sd.is_nap = false)
+      AND er.start_datetime >= :cutoff
+    GROUP BY 1
 """)
 
 # Stored as NUMERIC(6,3): the DB rounds, so compare at the stored precision.
@@ -82,15 +131,58 @@ def _num(value: Any) -> Decimal:
     return Decimal(str(round(value, 3) if isinstance(value, float) else value))
 
 
+def _merge_ingest(out: dict[date, datetime], rows: list[Any]) -> dict[date, datetime]:
+    """Fold `(day, ingested_at)` rows into a newest-write-per-day map."""
+    for day, ingested_at in rows:
+        if day not in out or ingested_at > out[day]:
+            out[day] = ingested_at
+    return out
+
+
+def _sleep_ingest_by_day(db: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
+    """Newest write per night, over the sleep sessions the sleep score reads for one user."""
+    return _merge_ingest({}, db.execute(_INGEST_SLEEP_SESSIONS_BY_DAY, {"uid": uid, "cutoff": cutoff}).fetchall())
+
+
+def _resilience_ingest_by_day(db: Any, uid: UUID, cutoff: datetime) -> dict[date, datetime]:
+    """Newest write per day, over both inputs the resilience score reads for one user."""
+    params = {"uid": uid, "cutoff": cutoff, "type_id": _RMSSD_TYPE_ID}
+    out = _merge_ingest({}, db.execute(_INGEST_SAMPLES_BY_DAY, params).fetchall())
+    return _merge_ingest(out, db.execute(_INGEST_SLEEP_AGGREGATES_BY_DAY, params).fetchall())
+
+
+def _inputs_moved(
+    row_created_at: datetime | None, window_days: list[date], ingest_by_day: dict[date, datetime]
+) -> bool:
+    """Was any day this row was computed from written to after the row itself was written?"""
+    if row_created_at is None:  # a row predating `created_at` cannot be dated against the ingest
+        return False
+    return any(ingest_by_day.get(day, row_created_at) > row_created_at for day in window_days)
+
+
+def _sleep_window(local_start: datetime) -> list[date]:
+    """The nights `get_sleep_scores_for_records` reads for one row: its own + the rolling history."""
+    first_night = local_start.date() - timedelta(days=sleep_config.rolling_window_nights + 1)
+    return [first_night + timedelta(days=i) for i in range((local_start.date() - first_night).days + 1)]
+
+
+def _resilience_window(ref_day: date) -> list[date]:
+    """The days `get_hrv_cv_scores_for_date_range` reads for one row, in the same order it builds them."""
+    return [ref_day - timedelta(days=i) for i in range(resilience_config.lookback_days, 0, -1)]
+
+
 def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
+    """Returns (mismatches, drift) — drift is a mismatch whose own inputs moved after the row."""
     rows = db.execute(_STORED_SLEEP, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
     for row in rows:
         by_user[UUID(str(row.user_id))].append(row)
 
     mismatches = 0
+    drift = 0
     for uid, user_rows in by_user.items():
         sessions = [(UUID(str(r.event_record_id)), UUID(str(r.data_source_id)), r.local_end) for r in user_rows]
+        ingest = _sleep_ingest_by_day(db, uid, cutoff)
         try:
             built = {s.event_record_id: s for s in sleep_score_service.build_internal_sleep_scores(db, uid, sessions)}
         except Exception as exc:  # a recomputation that cannot run is a parity failure, not a skip
@@ -108,17 +200,22 @@ def check_sleep(db: Any, cutoff: datetime) -> tuple[int, int]:
             stored_v, recomp_v = _num(row.value), _num(created.value)
             stored_c, recomp_c = _components(row.components), _components(created.components)
             ok = _num(stored_v) == _num(recomp_v) and stored_c == recomp_c
-            if not ok:
+            if ok:
+                status = "OK"
+            elif _inputs_moved(row.created_at, _sleep_window(row.local_start), ingest):
+                # Its night's record (or a history night's) was written after this row: the inputs
+                # this score was computed from are gone.
+                drift += 1
+                status = "DRIFT"
+            else:
                 mismatches += 1
-            print(
-                f"{day} sleep stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} "
-                f"{'OK' if ok else 'MISMATCH'}"
-            )
-    return mismatches, 0
+                status = "MISMATCH"
+            print(f"{day} sleep stored={stored_v}/{stored_c} recomputed={recomp_v}/{recomp_c} {status}")
+    return mismatches, drift
 
 
-def check_resilience(db: Any, cutoff: datetime, timezone_: ZoneInfo, now: datetime | None = None) -> tuple[int, int]:
-    """Returns (mismatches, drift) — drift is a score in a lookback window that is still open."""
+def check_resilience(db: Any, cutoff: datetime) -> tuple[int, int]:
+    """Returns (mismatches, drift) — drift is a mismatch whose own inputs moved after the row."""
     rows = db.execute(_STORED_RESILIENCE, {"cutoff": cutoff}).fetchall()
     by_user: dict[UUID, list[Any]] = defaultdict(list)
     for row in rows:
@@ -126,11 +223,9 @@ def check_resilience(db: Any, cutoff: datetime, timezone_: ZoneInfo, now: dateti
 
     mismatches = 0
     drift = 0
-    # Rows are dated in the user's zone, so "today" has to be their today: the server's UTC date
-    # is a day behind for every zone east of Greenwich and shifts the drift/mismatch boundary.
-    today = (now or datetime.now(timezone_)).date()
     for uid, user_rows in by_user.items():
         ref_dates: list[date] = sorted({r.recorded_at.date() for r in user_rows})
+        ingest = _resilience_ingest_by_day(db, uid, cutoff)
         try:
             results = resilience_score_service.get_hrv_cv_scores_for_date_range(db, uid, ref_dates)
         except Exception as exc:
@@ -154,8 +249,7 @@ def check_resilience(db: Any, cutoff: datetime, timezone_: ZoneInfo, now: dateti
             ok = abs(stored_v - recomp_v) <= _TOLERANCE and stored_c == recomp_c
             if ok:
                 status = "OK"
-            elif (today - day).days <= resilience_config.lookback_days:
-                # That window has received syncs since the row was written; the numbers may move.
+            elif _inputs_moved(row.created_at, _resilience_window(day), ingest):
                 drift += 1
                 status = "DRIFT"
             else:
@@ -168,17 +262,16 @@ def check_resilience(db: Any, cutoff: datetime, timezone_: ZoneInfo, now: dateti
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=30, help="Look-back window (default 30)")
-    parser.add_argument("--timezone", default="Europe/Vienna", help="User timezone (default Europe/Vienna)")
     args = parser.parse_args()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     with SessionLocal() as db:
-        sleep_bad, _ = check_sleep(db, cutoff)
-        resilience_bad, resilience_drift = check_resilience(db, cutoff, ZoneInfo(args.timezone))
+        sleep_bad, sleep_drift = check_sleep(db, cutoff)
+        resilience_bad, resilience_drift = check_resilience(db, cutoff)
 
     print(
-        f"parity: {sleep_bad + resilience_bad} mismatch(es), {resilience_drift} drift "
-        f"(open lookback window) over the last {args.days} days"
+        f"parity: {sleep_bad + resilience_bad} mismatch(es), {sleep_drift + resilience_drift} drift "
+        f"(inputs rewritten after the row) over the last {args.days} days"
     )
     return 1 if sleep_bad + resilience_bad else 0
 

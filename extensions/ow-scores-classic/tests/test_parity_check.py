@@ -3,17 +3,19 @@
 It gates a production cutover, so the normalizer that makes a stored JSON component and a
 freshly built `ScoreComponent` comparable is pinned here. The first version compared a dict
 against a `ScoreComponent` object and reported every sleep row as a mismatch while the numbers
-were identical — this test is that bug.
+were identical — this test is that bug. The OK|MISSING|MISMATCH|DRIFT rule is pinned here too, and
+in particular that DRIFT means "the inputs moved after this row was written", not "this row is
+old".
 """
 
 import importlib.util
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -47,89 +49,131 @@ def test_numeric_compare_works_across_decimal_and_float() -> None:
 
 
 class _StubDB:
-    """Stands in for a Session: the checks only call execute(...).fetchall()."""
+    """Stands in for a Session, answering each of the gate's selects with its own rows.
 
-    def __init__(self, rows: list[object]) -> None:
-        self._rows = rows
+    The gate reads two kinds of thing — the stored scores and the per-day ingest times — and a stub
+    that answered both with the same rows would feed score rows into the drift rule and pass on
+    anything.
+    """
 
-    def execute(self, *_a: object, **_k: object) -> "_StubDB":
+    def __init__(self, stored: list[object], ingest: list[tuple[date, datetime]] | None = None) -> None:
+        self._stored = stored
+        self._ingest: list[object] = list(ingest or [])
+        self._pending: list[object] = []
+
+    def execute(self, statement: Any, *_a: object, **_k: object) -> "_StubDB":
+        is_stored = statement is parity._STORED_SLEEP or statement is parity._STORED_RESILIENCE
+        self._pending = self._stored if is_stored else self._ingest
         return self
 
     def fetchall(self) -> list[object]:
-        return self._rows
+        return self._pending
 
 
-_SG = ZoneInfo("Asia/Singapore")  # UTC+8: the server's UTC date is a day behind the user's
 _USER = UUID("00000000-0000-0000-0000-000000000001")
+# The fill task's own run: 00:03 on the night the row covers. Nothing before this can explain a
+# different recomputation; anything after it can.
+_ROW_WRITTEN = datetime(2026, 11, 3, 0, 3, tzinfo=timezone.utc)
 
 
-def _resilience_row(day: date, value: str) -> SimpleNamespace:
+def _resilience_row(day: date, value: str, created_at: datetime = _ROW_WRITTEN) -> SimpleNamespace:
     return SimpleNamespace(
         user_id=_USER,
-        recorded_at=datetime(day.year, day.month, day.day, 0, 0, tzinfo=_SG),
+        recorded_at=datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc),
+        created_at=created_at,
         value=Decimal(value),
         components={"days_counted": 14, "metric_type": "hrv", "resilience_score": 62.0},
     )
 
 
-def test_resilience_drift_window_is_the_users_today(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stale mismatch must not be masked as drift because the server clock is a day behind.
+def _sleep_row(day: date, value: str, created_at: datetime = _ROW_WRITTEN) -> SimpleNamespace:
+    local_end = datetime(day.year, day.month, day.day, 7, 0, tzinfo=timezone.utc)
+    return SimpleNamespace(
+        user_id=_USER,
+        event_record_id=_USER,
+        data_source_id=_USER,
+        recorded_at=local_end,
+        created_at=created_at,
+        local_start=local_end - timedelta(days=1, hours=8),  # the night the session started on
+        local_end=local_end,
+        value=Decimal(value),
+        components={},
+    )
 
-    Now is 2026-11-05 00:30 +08:00, which is still 2026-11-04 in UTC. With `date.today()` the
-    reference day 2026-11-03 looks 1 day old instead of 2, falls inside the 1-day open window and
-    is reported as DRIFT — the gate then exits 0 over a real mismatch.
+
+def _stub_results(_db: Any, _uid: Any, days: Any) -> dict[date, Any]:
+    return {d: SimpleNamespace(hrv_cv=9.0, days_counted=14, metric_type="hrv", resilience_score=62.0) for d in days}
+
+
+def test_a_mismatch_whose_inputs_moved_after_the_row_is_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DRIFT means "the inputs moved under the row", whatever the row's age.
+
+    The row was written 2026-11-03 00:03; the RMSSD samples for 2026-11-02 — a day inside this
+    row's own lookback window — arrived on 2026-11-04, after it. A recomputation legitimately sees
+    samples the writing run never had. Age is not the question: read 8 days later, or 8 days
+    earlier, this row is drift because of *when the ingest happened relative to the row*.
     """
     monkeypatch.setattr(parity.resilience_config, "lookback_days", 1)
-    monkeypatch.setattr(
-        parity.resilience_score_service,
-        "get_hrv_cv_scores_for_date_range",
-        lambda _db, _uid, _days: {
-            date(2026, 11, 3): SimpleNamespace(hrv_cv=9.0, days_counted=14, metric_type="hrv", resilience_score=62.0)
-        },
-    )
-    db = _StubDB([_resilience_row(date(2026, 11, 3), "12.0")])  # stored 12.0, recomputed 9.0
-
-    mismatches, drift = parity.check_resilience(
-        db, datetime(2026, 10, 1, tzinfo=timezone.utc), _SG, now=datetime(2026, 11, 5, 0, 30, tzinfo=_SG)
+    monkeypatch.setattr(parity.resilience_score_service, "get_hrv_cv_scores_for_date_range", _stub_results)
+    db = _StubDB(
+        [_resilience_row(date(2026, 11, 3), "12.0")],  # stored 12.0, recomputed 9.0
+        ingest=[(date(2026, 11, 2), datetime(2026, 11, 4, 9, 47, tzinfo=timezone.utc))],
     )
 
-    assert (mismatches, drift) == (1, 0)
+    assert parity.check_resilience(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 1)
 
 
-def test_resilience_inside_the_open_window_is_drift_not_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The row the DRIFT branch exists for: 2026-11-04 is the user's yesterday, inside the window."""
+def test_a_mismatch_whose_inputs_never_moved_stays_a_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The false-DRIFT half of the old age rule: a young row is not a forgiven row.
+
+    Nothing inside the row's own window was written after it, so a recomputation that disagrees is
+    a vendoring bug. Data that did arrive after the row but on a day the row never read (2026-10-20,
+    outside this 1-day window) cannot explain the difference either.
+    """
     monkeypatch.setattr(parity.resilience_config, "lookback_days", 1)
+    monkeypatch.setattr(parity.resilience_score_service, "get_hrv_cv_scores_for_date_range", _stub_results)
+    db = _StubDB(
+        [_resilience_row(date(2026, 11, 3), "12.0")],
+        ingest=[
+            (date(2026, 11, 2), datetime(2026, 11, 2, 23, 0, tzinfo=timezone.utc)),  # in window, before the row
+            (date(2026, 10, 20), datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc)),  # after the row, outside
+        ],
+    )
+
+    assert parity.check_resilience(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (1, 0)
+
+
+def test_a_sleep_mismatch_whose_session_was_resynced_after_the_row_is_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`check_sleep` had no stale allowance at all, though the same mechanism moves its numbers.
+
+    The night's own record was re-pushed (a provider correction, a re-sync) after the score row was
+    written, so its sleep_details — the only input the sleep score has — are newer than the row.
+    """
     monkeypatch.setattr(
-        parity.resilience_score_service,
-        "get_hrv_cv_scores_for_date_range",
-        lambda _db, _uid, _days: {
-            date(2026, 11, 4): SimpleNamespace(hrv_cv=9.0, days_counted=14, metric_type="hrv", resilience_score=62.0)
-        },
+        parity.sleep_score_service,
+        "build_internal_sleep_scores",
+        lambda _db, _uid, sessions: [
+            SimpleNamespace(event_record_id=rid, value=70.0, components={}) for rid, _ds, _end in sessions
+        ],
     )
-    db = _StubDB([_resilience_row(date(2026, 11, 4), "12.0")])
-
-    mismatches, drift = parity.check_resilience(
-        db, datetime(2026, 10, 1, tzinfo=timezone.utc), _SG, now=datetime(2026, 11, 5, 0, 30, tzinfo=_SG)
+    row = _sleep_row(date(2026, 11, 3), "80.0")  # stored 80.0, recomputed 70.0
+    db = _StubDB(
+        [row],
+        ingest=[(row.local_start.date(), datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc))],  # re-sync, after the row
     )
 
-    assert (mismatches, drift) == (0, 1)
+    assert parity.check_sleep(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (0, 1)
 
 
 def test_a_recompute_that_cannot_run_counts_as_a_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Both checks return (mismatches, drift), and a crash is never a silent 0."""
-    row = SimpleNamespace(
-        user_id=_USER,
-        event_record_id=_USER,
-        data_source_id=_USER,
-        local_end=datetime(2026, 11, 3, tzinfo=timezone.utc),
-        recorded_at=datetime(2026, 11, 3, tzinfo=timezone.utc),
-        value=Decimal("80.0"),
-        components={},
-    )
 
     def _boom(*_a: object, **_k: object) -> None:
         raise RuntimeError("no such table: sleep_details")
 
     monkeypatch.setattr(parity.sleep_score_service, "build_internal_sleep_scores", _boom)
+    db = _StubDB([_sleep_row(date(2026, 11, 3), "80.0")])
 
-    assert parity.check_sleep(_StubDB([row]), datetime(2026, 10, 1, tzinfo=timezone.utc)) == (1, 0)
+    assert parity.check_sleep(db, datetime(2026, 10, 1, tzinfo=timezone.utc)) == (1, 0)

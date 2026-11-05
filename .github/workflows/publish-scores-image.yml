@@ -17,6 +17,10 @@ on:
         description: "Upstream backend image tag to build on, e.g. 0.11.0"
         required: true
         default: "0.11.0"
+      upstream_digest:
+        description: "Digest of that tag — the base is FROM tag@digest, so the two must move together"
+        required: true
+        default: "sha256:aaa0ccc7e6dcfbb3a36db6e0f63ec2782cf31a5bbd7cb466d11cd8d4657bc6dd"
 
 permissions:
   contents: read
@@ -28,18 +32,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A tag push carries the upstream tag as `scores-<tag>`; a dispatch types it directly.
-      - name: Resolve upstream tag
+      # A tag push carries the upstream tag as `scores-<tag>`; a dispatch types it directly. Tag and
+      # digest are resolved as one pair and passed as one pair: the Dockerfile pins the base with
+      # `FROM ${UPSTREAM_TAG}@${UPSTREAM_DIGEST}`, so a dispatch that moved only the tag would fail
+      # the build with an opaque `manifest verification failed` error. DEFAULT_DIGEST is the
+      # Dockerfile's own ARG default, used on a tag push — re-pin both together on a bump.
+      - name: Resolve upstream pin
         id: upstream
         env:
           INPUT_TAG: ${{ inputs.upstream_tag }}
+          INPUT_DIGEST: ${{ inputs.upstream_digest }}
           REF_NAME: ${{ github.ref_name }}
+          DEFAULT_DIGEST: sha256:aaa0ccc7e6dcfbb3a36db6e0f63ec2782cf31a5bbd7cb466d11cd8d4657bc6dd
         run: |
           if [ -n "$INPUT_TAG" ]; then
             echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${REF_NAME#scores-}" >> "$GITHUB_OUTPUT"
           fi
+          echo "digest=${INPUT_DIGEST:-$DEFAULT_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -55,6 +66,7 @@ jobs:
           file: extensions/ow-scores-classic/Dockerfile
           build-args: |
             UPSTREAM_TAG=${{ steps.upstream.outputs.tag }}
+            UPSTREAM_DIGEST=${{ steps.upstream.outputs.digest }}
           push: true
           tags: |
             ghcr.io/brunnseb/open-wearables-backend:${{ steps.upstream.outputs.tag }}-scores.${{ github.run_number }}

@@ -8,6 +8,12 @@ wrong — investigate it, never "tune" a number.
 
 Read-only: it writes nothing.
 
+Invocation — it needs core's settings, models and database URL, so run it inside the app container
+(it is not executable and has no shebang, and since the image `COPY` was narrowed it is not inside
+the image either):
+    docker cp scripts/parity_check.py open-wearables:/tmp/pc.py
+    docker exec open-wearables python /tmp/pc.py --days 30
+
 One line per stored row:  date  category  user=<id>  stored=<v>/<comps>  recomputed=<v>/<comps>  OK|MISMATCH|DRIFT
 One line per gap:         date  category  user=<id>  MISSING
 Exit 0 when every stored score in a closed window is reproduced; 1 on any MISMATCH. MISSING and

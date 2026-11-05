@@ -17,11 +17,6 @@ from ow_scores_classic.tasks import FILL_MISSING_RESILIENCE_SCORES, FILL_MISSING
 SLEEP_BEAT_KEY = "ow-scores-classic-fill-missing-sleep-scores"
 RESILIENCE_BEAT_KEY = "ow-scores-classic-fill-missing-resilience-scores"
 
-# Core ran both fills on `settings.{sleep,resilience}_score_interval_seconds`; both default to
-# 600 s and the fork pins one number so the beat entries stay identical across core releases that
-# rename those settings.
-_FILL_INTERVAL_SECONDS = 600.0
-
 
 @dataclass
 class OwScoresClassicExtension(OWExtension):
@@ -46,13 +41,13 @@ class OwScoresClassicExtension(OWExtension):
         return {
             SLEEP_BEAT_KEY: {
                 "task": FILL_MISSING_SLEEP_SCORES,
-                "schedule": _FILL_INTERVAL_SECONDS,
+                "schedule": float(settings.sleep_score_interval_seconds),
                 "args": (),
                 "kwargs": {},
             },
             RESILIENCE_BEAT_KEY: {
                 "task": FILL_MISSING_RESILIENCE_SCORES,
-                "schedule": _FILL_INTERVAL_SECONDS,
+                "schedule": float(settings.resilience_score_interval_seconds),
                 "args": (),
                 "kwargs": {},
             },

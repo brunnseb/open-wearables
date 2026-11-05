@@ -7,7 +7,7 @@ WHICH of the two writers runs, in code, not in a `.env` file.
 """
 
 import pytest
-from ow_scores_classic.extension import OwScoresClassicExtension
+from ow_scores_classic.extension import RESILIENCE_BEAT_KEY, SLEEP_BEAT_KEY, OwScoresClassicExtension
 
 from app.config import settings
 from app.extensions import collect_beat_schedule, get_extensions
@@ -41,7 +41,8 @@ def test_no_beat_entries_while_core_still_writes_scores(monkeypatch: pytest.Monk
     assert not BEAT_KEYS & set(collect_beat_schedule())
 
 
-def test_beat_entries_use_only_documented_fields(extension_is_the_writer: None) -> None:
+@pytest.mark.usefixtures("extension_is_the_writer")
+def test_beat_entries_use_only_documented_fields() -> None:
     sched = OwScoresClassicExtension().beat_schedule()
     assert set(sched) == {
         "ow-scores-classic-fill-missing-sleep-scores",
@@ -53,7 +54,25 @@ def test_beat_entries_use_only_documented_fields(extension_is_the_writer: None) 
     assert {entry["task"] for entry in sched.values()} == TASK_NAMES
 
 
-def test_core_discovers_the_extension(extension_is_the_writer: None) -> None:
+@pytest.mark.usefixtures("extension_is_the_writer")
+def test_beat_intervals_come_from_cores_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The box's only score writer must honour the cadence core's settings ask for.
+
+    The fork pinned one hardcoded 600 s, which silently ignored `SLEEP_SCORE_INTERVAL_SECONDS` /
+    `RESILIENCE_SCORE_INTERVAL_SECONDS` — still real settings in this core, and the operator's only
+    knob for how often the fills run.
+    """
+    monkeypatch.setattr(settings, "sleep_score_interval_seconds", 900)
+    monkeypatch.setattr(settings, "resilience_score_interval_seconds", 1200)
+
+    sched = OwScoresClassicExtension().beat_schedule()
+
+    assert sched[SLEEP_BEAT_KEY]["schedule"] == 900.0
+    assert sched[RESILIENCE_BEAT_KEY]["schedule"] == 1200.0
+
+
+@pytest.mark.usefixtures("extension_is_the_writer")
+def test_core_discovers_the_extension() -> None:
     """The entry point is installed, so core loads it and schedules its beats."""
     get_extensions.cache_clear()
     mine = [e for e in get_extensions() if e.name == "ow_scores_classic"]
@@ -67,9 +86,8 @@ def test_core_discovers_the_extension(extension_is_the_writer: None) -> None:
     assert set(sched) >= BEAT_KEYS, f"beats not collected: {sorted(sched)}"
 
 
-def test_core_disables_the_extension_on_a_newer_core(
-    extension_is_the_writer: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.usefixtures("extension_is_the_writer")
+def test_core_disables_the_extension_on_a_newer_core(monkeypatch: pytest.MonkeyPatch) -> None:
     """Core 0.12 removes the modules this package imports: it must disable, not crash the app."""
     monkeypatch.setattr("app.extensions.core_version", "0.12.0")
     get_extensions.cache_clear()

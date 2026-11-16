@@ -760,4 +760,6 @@ curl -X POST "http://localhost:8000/api/v1/webhooks/endpoints/ep_2t8Q4Xv9mNkRpLz
 
 Omit the body to default to `workout.created`.
 
-The test message pins `event_id` to `test.<endpoint-id>.<event-type>`, and Svix deduplicates on `event_id`. So a second test of the same event type inside the dedupe window answers `409 Conflict` rather than delivering twice — to fire a repeat, create a message through the Svix API with a distinct `event_id`. The sample payload names a synthetic Open Wearables user, so a receiver that looks the account up will answer `404`: that means the signature verified and the wiring is right, not that it is broken.
+The test message pins `event_id` to `test.<endpoint-id>.<event-type>`, and Svix deduplicates on `event_id`. So a second test of the same event type inside the dedupe window is rejected by Svix as a duplicate (`409`), which the app turns into `500 Failed to send test event.` — no second delivery goes out. To fire a repeat, create a message through the Svix API with a distinct `event_id`.
+
+The sample payload names a synthetic Open Wearables user, so a receiver that resolves the sender's account answers `404`. That means the delivery reached the receiver and its handler ran — a refused signature never gets that far. A mistyped path also answers `404`, so confirm the URL before reading anything into it.

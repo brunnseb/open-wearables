@@ -32,6 +32,13 @@ repos:
         files: ^backend/app/.*\.py$
         pass_filenames: false
 
+      - id: commit-msg-bead-id
+        name: commit subject names a bead
+        entry: .githooks/check_commit_msg.sh
+        language: system
+        always_run: true
+        stages: [commit-msg]
+
       - id: prettier-check
         name: prettier check
         entry: sh -c 'cd frontend && bun run format:check'

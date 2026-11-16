@@ -7,6 +7,7 @@ Open Wearables is a health/wearable data aggregation platform with a Python/Fast
 - **This file** - Project overview, development workflow, general guidelines
 - **[backend/AGENTS.md](backend/AGENTS.md)** - Backend-specific patterns and code examples
 - **[frontend/AGENTS.md](frontend/AGENTS.md)** - Frontend architecture, testing, and review rules
+- **[CODING_STANDARDS.md](CODING_STANDARDS.md)** - The judgement rules review checks code against
 - **[mcp/README.md](mcp/README.md)** - MCP server setup and available tools
 - **[docs/dev-guides/how-to-add-new-provider.mdx](docs/dev-guides/how-to-add-new-provider.mdx)** - Adding wearable providers
 
@@ -34,6 +35,10 @@ open-wearables/
 ## Development Workflow
 
 ### Docker (Recommended)
+
+The compose files in this checkout start the **development** stack only. Whatever serves a real deployment
+lives outside this repo; changing behaviour in production means changing that stack, not these files. When
+you add a service to compose, say so — the deployment stack has to list it too.
 
 ```bash
 # Start all services
@@ -77,6 +82,10 @@ make stop
 ```bash
 cd backend && uv run pre-commit run --all-files
 ```
+
+That form only sees backend files: run it from the repo root (with `pre-commit` on `PATH`, e.g.
+`uv run --with pre-commit pre-commit run --from-ref origin/main --to-ref HEAD`) to check a changeset that
+touches anything else — from `backend/` the path filters match nothing outside `backend/` and still exit 0.
 
 **Frontend:**
 ```bash

@@ -120,7 +120,7 @@ When working on documentation in the `docs/` directory:
 - Show both success and error response examples with realistic data
 - Include rate limiting information with specific limits
 - Provide authentication examples showing proper format
-- Explain all HTTP status codes and error handling
+- Explain all HTTP status codes and error handling, tracing each code to this route's own error mapping: what a helper raises underneath is not what the caller receives
 
 ### Accessibility
 - Include descriptive alt text for all images and diagrams

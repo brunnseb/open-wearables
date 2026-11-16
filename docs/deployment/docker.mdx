@@ -54,7 +54,7 @@ A typical deployment consists of the application containers plus their backing s
 - PostgreSQL - primary database
 - Redis - Celery broker and cache
 - `flower` (optional) - Celery monitoring, from the backend image
-- `svix-server` (optional) - only needed when [outgoing webhooks](/api-reference/guides/webhooks) are enabled; requires its own `svix` database
+- `svix-server` (optional) - only needed when [outgoing webhooks](/api-reference/guides/webhooks) are enabled; `svix/svix-server` 1.101.0 or newer, with its own `svix` database
 
 The backend reads all of its configuration from environment variables at runtime; `backend/config/.env.example` documents them. The frontend reads its API URL at runtime as well (see [Frontend configuration](#frontend-configuration)). Neither image needs a per-environment rebuild.
 
@@ -203,7 +203,7 @@ By default every mobile SDK sync payload is queued in Redis. That's fine for ong
 
 In practice you will put the API and frontend behind a reverse proxy with TLS instead of exposing the container ports directly.
 
-To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service pointed at your Redis and Postgres—the `app` container creates the `svix` database on start (`scripts/init/create_svix_db.py`), the `SVIX_*` variables are documented in `backend/config/.env.example`, and [outgoing webhooks](/api-reference/guides/webhooks) covers delivery settings such as the private-IP allowlist. The development `docker-compose.yml` deliberately does not define the service, so that it cannot drift from a deployment that runs it.
+To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service—`svix/svix-server` 1.101.0 or newer, pointed at your Redis and Postgres through `SVIX_QUEUE_TYPE`, `SVIX_REDIS_DSN`, `SVIX_CACHE_TYPE` and `SVIX_DB_DSN`, with `SVIX_JWT_SECRET` matching the app's. Start `app` before `svix-server`: the app creates the `svix` database on boot, and only while `OUTGOING_WEBHOOKS_ENABLED=true` (`scripts/init/create_svix_db.py`). The app-side `SVIX_*` variables are documented in `backend/config/.env.example`, and [outgoing webhooks](/api-reference/guides/webhooks) covers delivery settings such as the private-IP allowlist. The development `docker-compose.yml` deliberately does not define the service, so that it cannot drift from a deployment that runs it.
 
 ## Logs
 

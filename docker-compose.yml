@@ -165,9 +165,10 @@ services:
     volumes:
       - redis_data:/data
 
-  # Outgoing webhooks need a svix-server; it is deliberately not defined here so this
-  # file cannot drift from the deployment that runs it. docs/deployment/docker.mdx says
-  # how to add one; scripts/start/app.sh already creates the svix database on start.
+  # Outgoing webhooks need a svix-server; it is deliberately not defined here so this file
+  # cannot drift from the deployment that runs it. docs/deployment/docker.mdx says how to
+  # add one. It needs the svix database, which the app creates on boot only while
+  # OUTGOING_WEBHOOKS_ENABLED=true - so start the app before svix-server.
 
   frontend:
     build:

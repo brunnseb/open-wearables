@@ -338,7 +338,8 @@ class Settings(BaseSettings):
     # (no svix-server container) never build a client, emit, or register event types.
     outgoing_webhooks_enabled: bool = False
     svix_server_url: str = "http://svix-server:8071"
-    # Signing secret used by the Svix server to verify JWTs.  Must match SVIX_JWT_SECRET in docker-compose.
+    # Signing secret used by the Svix server to verify JWTs.  Must match SVIX_JWT_SECRET on the
+    # svix-server service.
     svix_jwt_secret: SecretStr | None = None
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None

@@ -15,7 +15,6 @@ build:	## Builds docker image
 
 run:	## Runs the environment in detached mode
 	$(DOCKER_COMMAND) up -d --force-recreate
-	$(DOCKER_COMMAND) rm -f db-svix-init
 
 up:	## Runs the non-detached environment
 	$(DOCKER_COMMAND) up --force-recreate

@@ -20,6 +20,8 @@ Webhooks are delivered via [Svix](https://svix.com/), which handles retries, sig
 
 <Note>
   **Self-hosting:** outgoing webhooks are **disabled by default**. To emit events, set `OUTGOING_WEBHOOKS_ENABLED=true` in the backend `.env` and restart — no command-line flags needed, plain `docker compose up`. The `svix-server` container runs either way, and the app runs fine when it is absent (e.g. a deployment without webhooks). On managed Postgres (AWS RDS / Railway), the app's database user must be allowed to create databases, or create a `svix` database up front — Svix keeps its schema there.
+
+  **Endpoint on a private network:** Svix refuses to deliver into private IP space, so a container-to-container endpoint URL such as `http://backend-app:8080/...` needs the delivery target's subnet whitelisted on the `svix-server` container — `SVIX_WHITELIST_SUBNETS: '["172.22.0.0/24"]'` (TOML sequence syntax, not a bare value: the config parser rejects a plain string). Without it every attempt fails with `requests to this IP range are blocked (see the server configuration)` and the receiver never sees a request. Newer Svix also has `whitelist_names`, which is narrower; `v1.101.0` has only the subnets form.
 </Note>
 
 <CardGroup cols={2}>
@@ -757,3 +759,5 @@ curl -X POST "http://localhost:8000/api/v1/webhooks/endpoints/ep_2t8Q4Xv9mNkRpLz
 ```
 
 Omit the body to default to `workout.created`.
+
+The test message pins `event_id` to `test.<endpoint-id>.<event-type>`, and Svix deduplicates on `event_id`. So a second test of the same event type inside the dedupe window answers `409 Conflict` rather than delivering twice — to fire a repeat, create a message through the Svix API with a distinct `event_id`. The sample payload names a synthetic Open Wearables user, so a receiver that looks the account up will answer `404`: that means the signature verified and the wiring is right, not that it is broken.

@@ -15,7 +15,6 @@ services:
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./backend/scripts/init/create-svix-db.sql:/docker-entrypoint-initdb.d/create-svix-db.sql:ro
 
   app:
     build:
@@ -166,39 +165,9 @@ services:
     volumes:
       - redis_data:/data
 
-  svix-server:
-    container_name: svix-server__open-wearables
-    image: svix/svix-server:v1.101.0
-    entrypoint:
-      - sh
-      - -c
-      - |
-        : "$${SVIX_JWT_SECRET:=$$SECRET_KEY}"
-        export SVIX_JWT_SECRET
-        exec svix-server "$$@"
-      - --
-    command: ["--run-migrations"]
-    env_file:
-      - ./backend/config/.env
-    environment:
-      SVIX_DB_DSN: "postgresql://${DB_USER:-open-wearables}:${DB_PASSWORD:-open-wearables}@${DB_HOST:-db}:${DB_PORT:-5432}/svix"
-      SVIX_QUEUE_TYPE: "redis"
-      SVIX_REDIS_DSN: "redis://redis:6379/1"
-      SVIX_CACHE_TYPE: "redis"
-    ports:
-      - "${SVIX_PORT:-8071}:8071"
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "svix-server", "healthcheck", "http://localhost:8071"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
-    restart: on-failure
+  # Outgoing webhooks need a svix-server; it is deliberately not defined here so this
+  # file cannot drift from the deployment that runs it. docs/deployment/docker.mdx says
+  # how to add one; scripts/start/app.sh already creates the svix database on start.
 
   frontend:
     build:

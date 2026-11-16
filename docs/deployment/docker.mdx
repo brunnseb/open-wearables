@@ -203,7 +203,7 @@ By default every mobile SDK sync payload is queued in Redis. That's fine for ong
 
 In practice you will put the API and frontend behind a reverse proxy with TLS instead of exposing the container ports directly.
 
-To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service and a `svix` database; the development `docker-compose.yml` shows the wiring.
+To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service pointed at your Redis and Postgres—the `app` container creates the `svix` database on start (`scripts/init/create_svix_db.py`), the `SVIX_*` variables are documented in `backend/config/.env.example`, and [outgoing webhooks](/api-reference/guides/webhooks) covers delivery settings such as the private-IP allowlist. The development `docker-compose.yml` deliberately does not define the service, so that it cannot drift from a deployment that runs it.
 
 ## Logs
 

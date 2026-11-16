@@ -6,6 +6,9 @@ name: Publish Docker images
 # Multi-arch (linux/amd64 + linux/arm64). Each arch builds natively on its
 # own runner and pushes an untagged image by digest. A merge job then
 # publishes one tagged manifest list per image.
+#
+# A repository without Docker Hub secrets - a fork - skips the build and merge jobs
+# instead of failing the login step: there is nothing to push to there.
 on:
   schedule:
     - cron: "0 2 * * *" # 02:00 UTC daily; scheduled runs use the default branch (main)
@@ -53,8 +56,30 @@ jobs:
             exit 1
           fi
 
+  # Secrets are not readable in a job-level if, so this job turns their presence
+  # into an output the publishing jobs can gate on.
+  credentials:
+    runs-on: ubuntu-latest
+    outputs:
+      have_dockerhub: ${{ steps.check.outputs.have_dockerhub }}
+    steps:
+      - name: Check for Docker Hub credentials
+        id: check
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "have_dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_dockerhub=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Docker Hub credentials configured - image publishing skipped"
+          fi
+
   build:
-    needs: validate
+    needs: [validate, credentials]
+    if: needs.credentials.outputs.have_dockerhub == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -139,7 +164,8 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: build
+    needs: [build, credentials]
+    if: needs.credentials.outputs.have_dockerhub == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
